@@ -1,0 +1,247 @@
+Here’s a clean, practical **`README.md`** you can drop straight into the project.
+
+---
+
+# DOSBox-X Mailbox Bridge
+
+A **host ↔ DOS guest command bridge** using a shared folder and a simple mailbox protocol.
+
+This project lets a modern host system (Linux, macOS, Windows) **send commands to a DOS environment running inside DOSBox-X** and **receive the output back**, without sockets, pipes, or emulator patching.
+
+It works by running:
+
+* a **DOS-side command server** (`MBXSRV.EXE`) inside DOSBox-X, and
+* a **host-side C++ client** (`mbxhost`) on your real machine,
+
+both communicating through ordinary files in a mounted shared directory.
+
+---
+
+## Why this exists
+
+DOSBox-X does not provide a clean stdin/stdout RPC interface for external control.
+However, it *does* provide reliable filesystem sharing.
+
+This project exploits that fact using a robust, crash-tolerant **mailbox protocol**:
+
+* Atomic file renames
+* Polling with timeouts
+* Clear status, logging, and error reporting
+* No emulator modifications required
+
+This approach is:
+
+* Portable
+* Debuggable
+* Emulator-agnostic
+* Friendly to automation and LLM tooling
+
+---
+
+## Architecture overview
+
+```
+Host OS (macOS / Linux / Windows)
+│
+│  mbxhost (C++17)
+│
+│  writes CMD.NEW
+│  renames → CMD.TXT
+│
+├── Shared folder (mounted in DOSBox-X)
+│
+│  CMD.TXT   ← input commands
+│  OUT.TXT   → stdout from DOS
+│  RC.TXT    → return code
+│  STA.TXT   → server status
+│  LOG.TXT   → server log
+│
+│
+│  MBXSRV.EXE (OpenWatcom, DOS)
+│
+│  polls → executes → replies
+│
+└── DOSBox-X (guest)
+```
+
+**Host** = your modern OS
+**Guest** = the DOS environment inside DOSBox-X
+
+---
+
+## File protocol (important)
+
+The protocol relies on *write-then-rename* to avoid partial reads.
+
+### Input
+
+* Host writes `CMD.NEW`
+* Host renames `CMD.NEW` → `CMD.TXT`
+* Guest renames `CMD.TXT` → `CMD.RUN` to claim it
+
+### Output
+
+* Guest writes `OUT.NEW`
+* Guest renames `OUT.NEW` → `OUT.TXT`
+* Guest writes `RC.NEW` → `RC.TXT` (return code)
+
+### Status & logs
+
+* `STA.TXT` — `READY`, `RUNNING`, `BYE`
+* `LOG.TXT` — timestamped server log
+
+Never write `CMD.TXT` directly.
+
+---
+
+## Components
+
+### 1. `MBXSRV.EXE` (DOS guest)
+
+A robust mailbox command server written in C for OpenWatcom.
+
+Features:
+
+* Polling loop with configurable delay
+* Crash recovery (handles leftover `CMD.RUN`)
+* Multi-line scripts (entire CMD file becomes a batch job)
+* Output capture
+* Return-code reporting
+* Local ESC key exit
+* Optional stderr capture (on FreeDOS / enhanced shells)
+* Detailed logging
+
+Runs inside DOSBox-X in the shared directory.
+
+---
+
+### 2. `mbxhost` (host client)
+
+A cross-platform C++17 CLI tool.
+
+Features:
+
+* REPL mode
+* One-shot command execution
+* Timeouts and error handling
+* Atomic file operations
+* Works on Linux, macOS, Windows
+* No external dependencies
+
+---
+
+## Building
+
+### DOS guest (inside DOSBox-X)
+
+Requires **OpenWatcom**.
+
+```bat
+wcl -bt=dos -os -s -zq mbxsrv.c
+```
+
+Produces `MBXSRV.EXE`.
+
+---
+
+### Host client
+
+#### Linux / macOS
+
+```bash
+c++ -std=c++17 -O2 -o mbxhost mbxhost.cpp
+```
+
+#### Windows (MSVC)
+
+```bat
+cl /std:c++17 /O2 mbxhost.cpp
+```
+
+---
+
+## Running
+
+### 1. Set up DOSBox-X
+
+Mount a shared directory:
+
+```ini
+mount z /path/to/shared
+z:
+MBXSRV
+```
+
+Leave `MBXSRV.EXE` running.
+
+---
+
+### 2. Use the host client
+
+#### REPL mode
+
+```bash
+./mbxhost ./shared
+```
+
+Example:
+
+```
+dos> dir
+dos> ver
+dos> quit-guest
+```
+
+#### One-shot mode
+
+```bash
+./mbxhost ./shared --cmd "dir" --timeout 8000
+```
+
+---
+
+## Special commands
+
+* `EXIT` or `QUIT`
+  Sent to the guest to stop `MBXSRV`.
+
+* Local REPL command:
+
+  * `exit` → quit host only
+  * `quit-guest` → send `EXIT` to DOS and quit
+
+---
+
+## Notes & caveats
+
+* **Use a local disk** for the shared folder. Network mounts can cause timestamp delays.
+* DOS stdout redirection is reliable; stderr capture depends on the DOS shell.
+* Polling interval and timeout are tunable.
+* This is intentionally boring infrastructure — boring is good.
+
+---
+
+## Why not sockets / mmap / pipes?
+
+* DOS doesn’t have them
+* DOSBox-X doesn’t expose them cleanly
+* Files are universal, inspectable, and recoverable
+
+This is effectively **RPC via 1989 technology**, and it works shockingly well.
+
+---
+
+## License
+
+Public domain / MIT — do whatever you want.
+
+---
+
+## Philosophy
+
+> The most robust IPC is the one you can debug with a hex editor
+> while the machine is on fire.
+
+This project embraces that idea wholeheartedly.
+
+---
