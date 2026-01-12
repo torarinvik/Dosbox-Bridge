@@ -45,10 +45,21 @@ This DOS executable runs inside DOSBox-X and polls the shared folder for incomin
 - From a DOS/Windows command prompt with `wcl` on `PATH`:
 
 ```bat
-wcl -bt=dos -os -s -zq dosbox-client.c
+wcl -bt=dos -ml -os -s -zq -fe=MBXSRV.EXE dosbox-client.c
 ```
 
+Notes:
+
+- Prefer `wcl` (16-bit real-mode DOS) for `MBXSRV.EXE`. It tends to be the most reliable inside DOSBox-X.
+- Avoid building `MBXSRV` with `wcl386`/DOS4GW unless you specifically need it; protected-mode builds can crash early in some DOSBox configurations.
+
 - Move the resulting `dosbox-client.exe`/`MBXSRV.EXE` into the shared folder; DOSBox-X can use it immediately.
+
+Helper (host-side): copy the source into your DOSBox shared folder with:
+
+```bash
+./prepare-mbxsrv-watcom.sh /path/to/dosbox/shared
+```
 
 ### Alternative: Borland C++ 3.x/5.x
 

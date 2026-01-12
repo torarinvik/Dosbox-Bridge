@@ -35,7 +35,9 @@
 
 /* Limits */
 #define MAX_LINE      512
-#define MAX_PAYLOAD   (32 * 1024) /* max bytes copied from CMD into JOB_BAT */
+/* IMPORTANT (16-bit builds): keep this <= 32767 unless using 32-bit types.
+    We use long counters below, but keep a conservative limit anyway. */
+#define MAX_PAYLOAD   30000L /* max bytes copied from CMD into JOB_BAT */
 
 static void ms_sleep(unsigned ms) { delay(ms); }
 
@@ -149,22 +151,49 @@ static int read_first_nonempty_line(const char *path, char *buf, size_t bufsz)
     return 0;
 }
 
+/* DOSBox shared-folder timing can occasionally present a just-renamed file
+   as empty/locked for a short period. Retry a few times before failing. */
+static int read_first_nonempty_line_retry(const char *path, char *buf, size_t bufsz, int tries, unsigned delay_ms)
+{
+    int i;
+    for (i = 0; i < tries; i++) {
+        if (read_first_nonempty_line(path, buf, bufsz)) return 1;
+        ms_sleep(delay_ms);
+    }
+    return 0;
+}
+
 /* Copy CMD.RUN into JOB_BAT as a script, with wrapper + RC capture.
    Returns 1 on success, 0 on failure. */
 static int build_job_bat_from_cmd(const char *cmd_path, int *out_payload_bytes)
 {
     FILE *in, *out;
     char line[MAX_LINE];
-    int total = 0;
+    long total = 0;
+
+    if (out_payload_bytes) *out_payload_bytes = 0;
 
     remove(JOB_BAT);
     remove(RC_NEW);
 
     in = fopen(cmd_path, "rt");
-    if (!in) return 0;
+    if (!in) {
+        char buf[200];
+        sprintf(buf, "ERROR: fopen(%s,rt) failed (errno=%d)", cmd_path, errno);
+        log_line(buf);
+        if (out_payload_bytes) *out_payload_bytes = -1;
+        return 0;
+    }
 
     out = fopen(JOB_BAT, "wt");
-    if (!out) { fclose(in); return 0; }
+    if (!out) {
+        char buf[200];
+        sprintf(buf, "ERROR: fopen(%s,wt) failed (errno=%d)", JOB_BAT, errno);
+        log_line(buf);
+        fclose(in);
+        if (out_payload_bytes) *out_payload_bytes = -2;
+        return 0;
+    }
 
     /* Wrapper */
     fputs("@echo off\r\n", out);
@@ -172,14 +201,25 @@ static int build_job_bat_from_cmd(const char *cmd_path, int *out_payload_bytes)
 
     /* Copy payload, line by line, enforcing MAX_PAYLOAD */
     while (fgets(line, sizeof(line), in)) {
-        int len = (int)strlen(line);
+        long len = 0;
+        int i;
+        /* Be defensive: ensure the buffer is NUL-terminated before strlen/fputs.
+           Some DOS C runtimes can behave oddly with text I/O on shared folders. */
+        for (i = 0; i < (int)sizeof(line); i++) {
+            if (line[i] == '\0') { len = i; break; }
+        }
+        if (i == (int)sizeof(line)) {
+            /* No NUL found: force termination and treat as a full buffer. */
+            line[sizeof(line) - 1] = '\0';
+            len = (int)sizeof(line) - 1;
+        }
         if (total + len > MAX_PAYLOAD) {
             fputs("rem ERROR: payload too large\r\n", out);
             /* Force errorlevel-ish */
             fputs("echo 1 > " RC_NEW "\r\n", out);
             fclose(in);
             fclose(out);
-            if (out_payload_bytes) *out_payload_bytes = total;
+            if (out_payload_bytes) *out_payload_bytes = (int)total;
             return 0;
         }
         fputs(line, out);
@@ -187,8 +227,26 @@ static int build_job_bat_from_cmd(const char *cmd_path, int *out_payload_bytes)
     }
 
     /* Always write return code file for host */
-    fputs("\r\nrem Capture ERRORLEVEL of last command\r\n", out);
-    fputs("echo %errorlevel% > " RC_NEW "\r\n", out);
+    fputs("\r\nrem Capture ERRORLEVEL of last command (COMMAND.COM-safe)\r\n", out);
+     /* Don't use SET here: OWSETENV.BAT can consume the environment block and make SET fail.
+         Instead, write RC.NEW directly using IF ERRORLEVEL + labels. */
+     /* We can't reliably read %ERRORLEVEL% in COMMAND.COM, and we avoid SET.
+         Record a simple severity code:
+            0 = success
+            1 = warnings (typical for OpenWatcom tools)
+            2 = errors (typical for OpenWatcom tools)
+         This uses ERRORLEVEL's >= semantics.
+     */
+     fputs("if errorlevel 2 goto mbx_rc2\r\n", out);
+     fputs("if errorlevel 1 goto mbx_rc1\r\n", out);
+     fputs("echo 0 > " RC_NEW "\r\n", out);
+     fputs("goto mbx_done\r\n", out);
+     fputs(":mbx_rc1\r\n", out);
+     fputs("echo 1 > " RC_NEW "\r\n", out);
+     fputs("goto mbx_done\r\n", out);
+     fputs(":mbx_rc2\r\n", out);
+     fputs("echo 2 > " RC_NEW "\r\n", out);
+     fputs(":mbx_done\r\n", out);
 
     fclose(in);
     fclose(out);
@@ -331,10 +389,12 @@ int main(int argc, char **argv)
         if (file_exists(CMD_RUN)) {
             int payload_bytes = 0;
             int sys_rc;
+            int build_ok;
+            int build_tries;
 
             set_status("RUNNING");
 
-            if (!read_first_nonempty_line(CMD_RUN, first, sizeof(first))) {
+            if (!read_first_nonempty_line_retry(CMD_RUN, first, sizeof(first), 10, 50)) {
                 log_line("ERROR: CMD.RUN empty");
                 write_error_output("CMD file is empty");
                 remove(CMD_RUN);
@@ -353,7 +413,21 @@ int main(int argc, char **argv)
             }
 
             /* Build job bat */
-            if (!build_job_bat_from_cmd(CMD_RUN, &payload_bytes)) {
+            build_ok = 0;
+            for (build_tries = 0; build_tries < 10; build_tries++) {
+                errno = 0;
+                payload_bytes = 0;
+                if (build_job_bat_from_cmd(CMD_RUN, &payload_bytes)) {
+                    build_ok = 1;
+                    break;
+                }
+                sprintf(logbuf, "WARN: build_job_bat retry %d/10 failed (payload=%d, errno=%d)",
+                        build_tries + 1, payload_bytes, errno);
+                log_line(logbuf);
+                ms_sleep(100);
+            }
+
+            if (!build_ok) {
                 sprintf(logbuf, "ERROR: build_job_bat failed (payload=%d, errno=%d)", payload_bytes, errno);
                 log_line(logbuf);
                 write_error_output("Failed to build MBXJOB.BAT (payload too large or file error)");
